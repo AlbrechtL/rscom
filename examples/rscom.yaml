@@ -1,0 +1,38 @@
+serial:
+  device: /dev/ttyUSB0
+  baud_rate: 115200
+  data_bits: 8
+  parity: none
+  stop_bits: 1
+  flow_control: none
+  timeout_ms: 30
+
+reconnect:
+  enabled: true
+  initial_delay_ms: 500
+  max_delay_ms: 5000
+
+logging:
+  session_log: logs/session.log
+  timestamps: true
+
+macros:
+  - key: F1
+    description: stop autoboot and open prompt
+    command: "\n"
+
+  - key: F2
+    description: print environment
+    command: "printenv"
+
+  - key: F3
+    description: set bootargs
+    command: "setenv bootargs console=ttyS0,115200 root=/dev/mmcblk0p2 rw"
+
+  - key: F4
+    description: save environment
+    command: "saveenv"
+
+  - key: F5
+    description: boot command
+    command: "run bootcmd"
