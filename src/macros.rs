@@ -5,10 +5,22 @@ use crossterm::event::KeyCode;
 use crate::config::MacroBindingConfig;
 use crate::error::AppError;
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum MacroSendMode {
+    /// Send the entire command at once (default behaviour).
+    Immediate,
+    /// Send one character at a time with a fixed delay between each.
+    CharDelay { ms: u64 },
+    /// Send one character at a time, waiting for the device to echo it back before proceeding.
+    /// `timeout_ms` is the per-character fallback if no echo arrives.
+    EchoSync { timeout_ms: u64 },
+}
+
 #[derive(Debug, Clone)]
 pub struct MacroBinding {
     pub command: String,
     pub description: Option<String>,
+    pub send_mode: MacroSendMode,
 }
 
 #[derive(Debug, Default)]
@@ -40,6 +52,11 @@ impl MacroSet {
                 MacroBinding {
                     command: item.command.clone(),
                     description: item.description.clone(),
+                    send_mode: match (item.char_delay_ms, item.echo_timeout_ms) {
+                        (Some(ms), None) => MacroSendMode::CharDelay { ms },
+                        (None, Some(timeout_ms)) => MacroSendMode::EchoSync { timeout_ms },
+                        _ => MacroSendMode::Immediate,
+                    },
                 },
             );
         }

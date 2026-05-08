@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::time::{Duration, Instant};
 
@@ -9,8 +10,15 @@ use serialport::SerialPort;
 use crate::config::AppConfig;
 use crate::error::AppError;
 use crate::logging::SessionLogger;
-use crate::macros::MacroSet;
+use crate::macros::{MacroSet, MacroSendMode};
 use crate::serial;
+
+struct PendingMacroSend {
+    remaining: VecDeque<u8>,
+    mode: MacroSendMode,
+    last_sent: u8,
+    last_sent_at: Instant,
+}
 
 pub fn run(config: AppConfig) -> Result<(), AppError> {
     let macros = MacroSet::from_config(&config.macros)?;
@@ -51,6 +59,7 @@ pub fn run(config: AppConfig) -> Result<(), AppError> {
     let mut next_reconnect_try = Instant::now();
     let mut waiting_ctrl_a_command = false;
     let mut stdout = std::io::stdout();
+    let mut pending_send: Option<PendingMacroSend> = None;
 
     loop {
         if port.is_none() && config.reconnect.enabled && Instant::now() >= next_reconnect_try {
@@ -68,24 +77,32 @@ pub fn run(config: AppConfig) -> Result<(), AppError> {
             }
         }
 
+        let mut received_buf = [0u8; 2048];
+        let received_len;
         if let Some(serial_port) = port.as_mut() {
-            let mut buf = [0u8; 2048];
-            match serial_port.read(&mut buf) {
+            match serial_port.read(&mut received_buf) {
                 Ok(size) if size > 0 => {
-                    stdout.write_all(&buf[..size])?;
+                    stdout.write_all(&received_buf[..size])?;
                     stdout.flush()?;
-                    logger.log_rx(&buf[..size]);
+                    logger.log_rx(&received_buf[..size]);
+                    received_len = size;
                 }
-                Ok(_) => {}
-                Err(err) if err.kind() == std::io::ErrorKind::TimedOut => {}
+                Ok(_) => { received_len = 0; }
+                Err(err) if err.kind() == std::io::ErrorKind::TimedOut => { received_len = 0; }
                 Err(err) => {
                     print_status(format!("serial read error: {err}. disconnecting"));
                     port = None;
                     next_reconnect_try = Instant::now() + Duration::from_millis(reconnect_delay);
                     reconnect_delay = (reconnect_delay.saturating_mul(2)).min(config.reconnect.max_delay_ms.max(100));
+                    received_len = 0;
                 }
             }
+        } else {
+            received_len = 0;
         }
+
+        // Tick any in-progress slow macro send.
+        tick_pending_send(&mut pending_send, &mut port, &mut logger, &received_buf[..received_len]);
 
         if event::poll(Duration::from_millis(20))? {
             let Event::Key(key_event) = event::read()? else {
@@ -111,10 +128,29 @@ pub fn run(config: AppConfig) -> Result<(), AppError> {
             }
 
             if let Some(binding) = macros.binding_for_keycode(&key_event.code) {
-                let mut payload = binding.command.clone().into_bytes();
-                payload.extend_from_slice(b"\r\n");
-                write_to_port(&mut port, &payload, &mut logger);
-                print_status(format!("macro sent: {}", binding.command));
+                let mut payload: VecDeque<u8> = binding.command.clone().into_bytes().into();
+                payload.extend([b'\r', b'\n']);
+
+                match binding.send_mode {
+                    MacroSendMode::Immediate => {
+                        let bytes: Vec<u8> = payload.into();
+                        write_to_port(&mut port, &bytes, &mut logger);
+                        print_status(format!("macro sent: {}", binding.command));
+                    }
+                    ref mode => {
+                        // Send first byte immediately; queue the rest.
+                        if let Some(first) = payload.pop_front() {
+                            write_to_port(&mut port, &[first], &mut logger);
+                            pending_send = Some(PendingMacroSend {
+                                remaining: payload,
+                                mode: mode.clone(),
+                                last_sent: first,
+                                last_sent_at: Instant::now(),
+                            });
+                            print_status(format!("macro started: {}", binding.command));
+                        }
+                    }
+                }
                 continue;
             }
 
@@ -125,6 +161,36 @@ pub fn run(config: AppConfig) -> Result<(), AppError> {
     }
 
     Ok(())
+}
+
+fn tick_pending_send(
+    pending: &mut Option<PendingMacroSend>,
+    port: &mut Option<Box<dyn SerialPort>>,
+    logger: &mut SessionLogger,
+    received: &[u8],
+) {
+    let Some(state) = pending else { return };
+
+    let fire = match state.mode {
+        MacroSendMode::CharDelay { ms } => state.last_sent_at.elapsed() >= Duration::from_millis(ms),
+        MacroSendMode::EchoSync { timeout_ms } => {
+            received.contains(&state.last_sent)
+                || state.last_sent_at.elapsed() >= Duration::from_millis(timeout_ms)
+        }
+        MacroSendMode::Immediate => unreachable!("Immediate mode never enters pending_send"),
+    };
+
+    if !fire {
+        return;
+    }
+
+    if let Some(byte) = state.remaining.pop_front() {
+        write_to_port(port, &[byte], logger);
+        state.last_sent = byte;
+        state.last_sent_at = Instant::now();
+    } else {
+        *pending = None;
+    }
 }
 
 fn print_start_banner(config: &AppConfig, macros: &MacroSet) {

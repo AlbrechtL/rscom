@@ -71,6 +71,15 @@ impl AppConfig {
             ));
         }
 
+        for item in &self.macros {
+            if item.char_delay_ms.is_some() && item.echo_timeout_ms.is_some() {
+                return Err(AppError::Config(format!(
+                    "macro {}: char_delay_ms and echo_timeout_ms are mutually exclusive",
+                    item.key
+                )));
+            }
+        }
+
         Ok(())
     }
 }
@@ -156,4 +165,9 @@ pub struct MacroBindingConfig {
     pub key: String,
     pub command: String,
     pub description: Option<String>,
+    /// Fixed inter-character delay in milliseconds. Mutually exclusive with `echo_timeout_ms`.
+    pub char_delay_ms: Option<u64>,
+    /// Per-character echo-sync timeout in milliseconds. Each character is held until the device
+    /// echoes it back, or this timeout elapses. Mutually exclusive with `char_delay_ms`.
+    pub echo_timeout_ms: Option<u64>,
 }
